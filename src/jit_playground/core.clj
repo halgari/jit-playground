@@ -31,7 +31,7 @@
     (match inst
            [:op result op arg] (let [arg (resolve arg env)
                                           ret (do-op op arg)
-                                          newenv (assoc env result arg)]
+                                          newenv (assoc env result ret)]
                                       (recur block (inc ip) newenv))
 
            [:op result op arg1 arg2] (let [arg1 (resolve arg1 env)
