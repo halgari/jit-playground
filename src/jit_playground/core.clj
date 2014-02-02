@@ -161,7 +161,7 @@
     (match inst
            [:op result op arg] (let [rarg (resolve arg env)
                                           ret (do-op op rarg)
-                                          newenv (assoc env result arg)]
+                                          newenv (assoc env result ret)]
                                  (recur block (inc ip) newenv start-block
                                         (conj trace-data inst)))
 
