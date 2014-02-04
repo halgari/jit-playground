@@ -30,15 +30,15 @@
   (let [inst (nth block ip)]
     (match inst
            [:op result op arg] (let [arg (resolve arg env)
-                                          ret (do-op op arg)
-                                          newenv (assoc env result arg)]
-                                      (recur block (inc ip) newenv))
+                                     ret (do-op op arg)
+                                     newenv (assoc env result arg)]
+                                 (recur block (inc ip) newenv))
 
            [:op result op arg1 arg2] (let [arg1 (resolve arg1 env)
-                                                arg2 (resolve arg2 env)
-                                                ret (do-op op arg1 arg2)
-                                                newenv (assoc env result ret)]
-                                            (recur block (inc ip) newenv))
+                                           arg2 (resolve arg2 env)
+                                           ret (do-op op arg1 arg2)
+                                           newenv (assoc env result ret)]
+                                       (recur block (inc ip) newenv))
 
            [:jump blk] (recur (get @*blocks* blk)
                               0
@@ -48,7 +48,19 @@
                                   (recur (get @*blocks* then) 0 env)
                                   (recur (get @*blocks* else) 0 env))
 
-           [:print-and-stop arg] (println (resolve arg env)))))
+           [:print-and-stop arg] (println (resolve arg env))
+
+           [:guard-value sym val blk] (let [rsym (resolve sym env)]
+                                        (if (= rsym val)
+                                          (recur block (inc ip) env)
+                                          (recur (get @*blocks* blk) 0 env)))
+
+           [:guard-true sym blk] (let [rsym (resolve sym env)]
+                                        (if rsym
+                                          (recur block (inc ip) env)
+                                          (recur (get @*blocks* blk) 0 env)))
+
+           [:loop] (recur block 0 env))))
 
 
 
@@ -105,6 +117,8 @@
                         (inc ip)
                         nenv
                         (conj new-block [:op resultvar op arg1 arg2])))))
+
+
 
            [:jump block] (let [res (do-pe block penv)]
                            (conj new-block [:jump res]))
@@ -234,6 +248,87 @@
           *code-cache* (atom {})
           *block-counts* (atom {})
           *already-traced* (atom #{})
-          {:keys [block env]} (trace (get @*blocks* 'b) 0 {'i 100 'x 5} 'b [])]
-  (interp (get @*blocks* block) 0 env)
-  (clojure.pprint/pprint @*blocks*))
+          ]
+  (let [{:keys [block env]} (trace (get @*blocks* 'b) 0 {'i 100 'x 5} 'b [])]
+            (interp (get @*blocks* block) 0 env)
+            (clojure.pprint/pprint @*blocks*)))
+
+(declare generate-assignments)
+
+(defn optimize [trace penv new-block]
+  (let [inst (first trace)]
+    (match inst
+           [:op resultvar op arg] (let [rarg (presolve arg penv)]
+                                    (if (const? rarg)
+                                      (let [res (do-op [op arg])
+                                            newenv (assoc penv resultvar res)]
+                                        (recur (next trace)
+                                               newenv
+                                               new-block))
+                                      (let [nenv (dissoc penv resultvar)]
+                                        (recur (next trace)
+                                               newenv
+                                               (conj new-block
+                                                     [:op resultvar op rarg])))))
+
+           [:op resultvar op arg1 arg2] (let [rarg1 (presolve arg1 penv)
+                                              rarg2 (presolve arg2 penv)]
+                                          (if (and (const? rarg1)
+                                                   (const? rarg2))
+                                            (let [res (do-op [op arg1 arg2])
+                                                  newenv (assoc penv resultvar res)]
+                                              (recur (next trace)
+                                                     newenv
+                                                     new-block))
+                                            (let [nenv (dissoc penv resultvar)]
+                                              (recur (next trace)
+                                                     newenv
+                                                     (conj new-block
+                                                           [:op resultvar op rarg1 rarg2])))))
+
+           [:guard-true v block] (let [val (presolve v penv)]
+                                   (if (const? val)
+                                     (recur (next trace)
+                                            penv
+                                            new-block)
+                                     (recur (next trace)
+                                            penv
+                                            (conj new-block
+                                                  [:guard-true v penv block]))))
+
+           [:guard-false v block] (let [val (presolve v penv)]
+                                    (if (const? val)
+                                      (recur (next trace)
+                                             penv
+                                             new-block)
+                                      (recur (next trace)
+                                             (assoc penv v false)
+                                             (conj
+                                              new-block
+                                              [:guard-false v penv block]))))
+
+           [:guard-value v c block] (let [val (presolve v penv)]
+                                      (if (and (const? val)
+                                               (= val c))
+                                        (recur (next trace)
+                                               penv
+                                               new-block)
+                                        (recur (next trace)
+                                               (assoc penv v c)
+                                               (conj
+                                                [:guard-value v c penv block]))))
+
+           [:loop] (generate-assignments new-block penv))))
+
+
+(defn generate-assignments [new-block penv]
+  (concat new-block
+          (for [[k v] penv]
+            [:op k 'same v])))
+
+
+(binding [*blocks* (atom larger-code)
+          *code-cache* (atom {})]
+  (let [{:keys [block env]} (trace (get @*blocks* 'b) 0 {'i 100 'x 5} 'b [])]
+            (interp (get @*blocks* block) 0 env)
+            (clojure.pprint/pprint @*blocks*)))
