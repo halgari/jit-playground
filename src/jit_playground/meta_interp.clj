@@ -56,9 +56,10 @@
              \] (let [val (nth data dp)]
                   (if (= val 0)
                     (recur ip+one dp (- sp 1))
-                    (recur-enter-jit (nth stack sp) dp sp)))
+                    (let [recur-point (nth stack sp)]
+                      (recur-enter-jit recur-point dp sp))))
              (recur ip+one dp sp)))
-         0))))
+         (exit)))))
 
 
 (def ^:dynamic *code*)
@@ -192,6 +193,10 @@
     (add-inst :get-char)
     nm))
 
+(defmethod analyze-seq 'exit
+  [[_]]
+  (add-inst :exit))
+
 (defmethod analyze-seq 'set-nth
   [[_ a b c]]
   (let [nm (gensym "set-nth")]
@@ -258,7 +263,6 @@
       (assert false (str arg " not found in " env)))))
 
 (defn do-op [op a b]
-  (println op a b)
   (condp = op
     '+ (+ a b)
     '< (< a b)
@@ -281,6 +285,8 @@
               (recur (get @*code* block) 0 env))
 
       :jump-enter-jit (let [[_ block] inst]
+
+                        #_(println block (resolve env 'sp) (resolve env 'dp) (resolve env 'ip))
                         (recur (get @*code* block) 0 env))
 
       :binop (let [[_ to op a b] inst
@@ -303,6 +309,11 @@
                     ip+1
                     (assoc env to (nth rv ridx))))
 
+      :print-char (let [[_ var] inst
+                        rvar (resolve env var)]
+                    (print (char rvar))
+                    (recur block ip+1 env))
+
       :set-nth (let [[_ arr idx val] inst
                  rarr (resolve env arr)
                  ridx (resolve env idx)
@@ -310,20 +321,34 @@
              (aset rarr ridx rval)
              (recur block
                     ip+1
-                    env)))))
+                    env))
+
+      :exit {:mode :exit
+             :env env
+             :block block})))
 
 
 (def hello-world "++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>.")
+
+(comment
+  (def mandelbrot (slurp "https://raw2.github.com/pablojorge/brainfuck/master/samples/mandelbrot.bf"))
+  (def primes (slurp "https://raw2.github.com/pablojorge/brainfuck/master/samples/primes.bf"))
+
+  (def test2 (slurp "https://raw2.github.com/garretraziel/mindfuck/master/tests/test2.b")))
+
+(defn new-bf-env [code]
+  {'code code
+   'code-length (count code)
+   'data (object-array (repeat 1024 0))
+   'stack (object-array 32)
+   'ip 0
+   'dp 0
+   'sp 0
+   })
 
 (binding [*code* (atom {:entry []})
           *current-block* (atom :entry)]
   (analyze bf-interp)
   (clojure.pprint/pprint  @*code*)
-  (interp (get @*code* :entry) 0 {'code hello-world
-                                  'code-length (count hello-world)
-                                  'data (object-array (repeat 1024 0))
-                                  'stack (object-array 32)
-                                  'ip 0
-                                  'dp 0
-                                  'sp 0
-                                  }))
+  (interp (get @*code* :entry) 0 (new-bf-env
+                                  hello-world)))
