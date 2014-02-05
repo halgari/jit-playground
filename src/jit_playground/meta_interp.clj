@@ -34,11 +34,12 @@
             dp dp
             sp 0]
        (promote ip)
-       (promote dp)
        (promote sp)
+       (promote dp)
        (if (< ip code-length)
          (let [inst (nth code ip)
                ip+one (+ ip 1)]
+           (promote  inst)
            (case inst
              \> (recur ip+one (+ dp 1))
              \< (recur ip+one (- dp 1))
@@ -57,7 +58,7 @@
                   (if (= val 0)
                     (recur ip+one dp (- sp 1))
                     (let [recur-point (nth stack sp)]
-                      (recur-enter-jit recur-point dp sp))))
+                      (recur-enter-jit [recur-point] recur-point dp sp))))
              (recur ip+one dp sp)))
          (exit)))))
 
@@ -227,13 +228,14 @@
     :terminated))
 
 (defmethod analyze-seq 'recur-enter-jit
-  [[_ & args]]
+  [[_ greens & args]]
+  (assert (vector? greens))
   (let [args (mapv analyze args)]
     (doall (map (fn [a b]
                   (add-inst :assign a b))
                 *recur-vars*
                 args))
-    (add-inst :jump-enter-jit *recur-block*)
+    (add-inst :jump-enter-jit greens *recur-block*)
     :terminated))
 
 (defmethod analyze-seq 'case
@@ -269,6 +271,10 @@
     '= (= a b)
     '- (- a b)))
 
+(def ^:dynamic *jit-counts*)
+(def ^:dynamic *jit-threshold*)
+
+
 (defn interp [block ip env]
   (let [inst (nth block ip)
         ip+1 (inc ip)]
@@ -284,10 +290,15 @@
       :jump (let [[_ block] inst]
               (recur (get @*code* block) 0 env))
 
-      :jump-enter-jit (let [[_ block] inst]
-
-                        #_(println block (resolve env 'sp) (resolve env 'dp) (resolve env 'ip))
-                        (recur (get @*code* block) 0 env))
+      :jump-enter-jit (let [[_ greens block] inst
+                            rgreens (mapv (partial resolve env) greens)]
+                        (swap! *jit-counts* update-in [[block rgreens]] (fnil inc 0))
+                        (if (> *jit-threshold* (get @*jit-counts* [block rgreens] 0))
+                          {:mode :trace
+                           :block block
+                           :env env
+                           :greens rgreens}
+                          (recur (get @*code* block) 0 env)))
 
       :binop (let [[_ to op a b] inst
                    ra (resolve env a)
@@ -336,6 +347,184 @@
 
   (def test2 (slurp "https://raw2.github.com/garretraziel/mindfuck/master/tests/test2.b")))
 
+(def bottles (slurp "https://raw2.github.com/garretraziel/mindfuck/master/tests/99bottles.b"))
+
+(println bottles)
+
+
+(def ^:dynamic *trace-end-block*)
+
+(defn trace [block ip env trace]
+  (let [inst (nth block ip)
+        ip+1 (inc ip)]
+    (case (first inst)
+      :promote (let [[_ arg block] inst
+                     rarg (resolve env arg)]
+                 (recur (get @*code* block) 0 env
+                        (conj trace [:guard-value arg rarg block])))
+
+      :assign (let [[_ to from] inst]
+                (recur block
+                       ip+1
+                       (assoc env to (resolve env from))
+                       (conj trace inst)))
+
+
+      :jump (let [[_ block] inst]
+              (recur (get @*code* block) 0 env trace))
+
+      :jump-enter-jit (let [[_ greens block] inst
+                            rgreens (mapv (partial resolve env) greens)]
+                        {:mode :optimize
+                         :block block
+                         :env env
+                         :trace (conj trace [:loop])})
+
+      :binop (let [[_ to op a b] inst
+                   ra (resolve env a)
+                   rb (resolve env b)]
+               (recur block
+                      ip+1
+                      (assoc env to (do-op op ra rb))
+                      (conj trace inst)))
+
+      :if (let [[_ test then else] inst
+                rtest (resolve env test)]
+            (if rtest
+              (recur (get @*code* then) 0 env (conj trace [:guard-true test else]))
+              (recur (get @*code* else) 0 env (conj trace [:guard-false test then]))))
+
+      :nth (let [[_ to v idx] inst
+                 rv (resolve env v)
+                 ridx (resolve env idx)]
+             (recur block
+                    ip+1
+                    (assoc env to (nth rv ridx))
+                    (conj trace inst)))
+
+      :print-char (let [[_ var] inst
+                        rvar (resolve env var)]
+                    (print (char rvar))
+                    (recur block ip+1 env (conj trace inst)))
+
+      :set-nth (let [[_ arr idx val] inst
+                 rarr (resolve env arr)
+                 ridx (resolve env idx)
+                 rval (resolve env val)]
+             (aset rarr ridx rval)
+             (recur block
+                    ip+1
+                    env
+                    (conj trace inst)))
+
+      :exit {:mode :exit
+             :env env
+             :block block
+             :trace trace})))
+
+
+(declare generate-assignments)
+
+(defn presolve [env x]
+  (assert (map? env))
+  (if (symbol? x)
+    (if (contains? env x)
+      (get env x)
+      x)
+    x))
+
+(def ^:dynamic *orig-env*)
+
+(defn optimize [trace penv new-block]
+  (let [inst (first trace)]
+    (case (first inst)
+      :assign (let [[_ to from] inst
+                    rfrom (presolve penv from)]
+                (if (const? rfrom)
+                  (recur (next trace)
+                         (assoc penv to rfrom)
+                         new-block)
+                  (recur (next trace)
+                         (dissoc penv to)
+                         (conj new-block
+                               inst))))
+
+      :binop (let [[_ to op a b] inst
+                   ra (presolve penv a)
+                   rb (presolve penv b)]
+               (if (and (const? ra)
+                        (const? rb))
+                 (recur (next trace)
+                        (assoc penv to (do-op op ra rb))
+                        new-block)
+                 (recur (next trace)
+                        (dissoc penv to)
+                        (conj new-block inst))))
+
+
+      :guard-true (let [[_ v block] inst
+                        val (presolve penv v)]
+                    (if (const? val)
+                      (recur (next trace)
+                             penv
+                             new-block)
+                      (recur (next trace)
+                             penv
+                             (conj new-block
+                                   [:guard-true v block]))))
+
+
+      :guard-false  (let [[_ v block] inst
+                          val (presolve penv v)]
+                      (if (const? val)
+                        (recur (next trace)
+                               penv
+                               new-block)
+                        (recur (next trace)
+                               (assoc penv v false)
+                               (conj
+                                new-block
+                                [:guard-false v block]))))
+
+      :guard-value (let [[_ v c block] inst
+                         val (presolve penv v)]
+                     (if (and (const? val)
+                              (= val c))
+                       (recur (next trace)
+                              penv
+                              new-block)
+                       (recur (next trace)
+                              (assoc penv v c)
+                              (conj
+                               new-block
+                               [:guard-value v c block]))))
+
+      :nth (let [[_ to from idx] inst
+                 rfrom (presolve penv from)
+                 ridx (presolve penv idx)]
+             (if (and (string? rfrom) ;; For now only fully constant fold strings
+                      (const? ridx))
+               (recur (next trace)
+                      (assoc penv to (nth rfrom ridx))
+                      new-block)
+               (and (string? ))
+               (recur (next trace)
+                      (dissoc penv to)
+                      (conj new-block inst))))
+
+      :set-nth (let [[_ to from idx] inst]
+             (recur (next trace)
+                    (dissoc penv to)
+                    (conj new-block inst)))
+
+      :loop (generate-assignments new-block penv))))
+
+
+(defn generate-assignments [new-block penv]
+  (concat new-block
+          (for [[k v] penv]
+            [:assign k v])))
+
 (defn new-bf-env [code]
   {'code code
    'code-length (count code)
@@ -346,9 +535,16 @@
    'sp 0
    })
 
+
 (binding [*code* (atom {:entry []})
-          *current-block* (atom :entry)]
+          *current-block* (atom :entry)
+          *jit-counts* (atom {})
+          *jit-threshold* 2]
   (analyze bf-interp)
   (clojure.pprint/pprint  @*code*)
-  (interp (get @*code* :entry) 0 (new-bf-env
-                                  hello-world)))
+  (let [jit-result (interp (get @*code* :entry) 0 (new-bf-env
+                                                   hello-world))
+        trace-result (trace (get @*code* (:block jit-result)) 0 (:env jit-result) [])]
+    (clojure.pprint/pprint (optimize (:trace trace-result) {'code hello-world
+                                                            'code-length (count hello-world)} []))
+    (println @*jit-counts*)))
