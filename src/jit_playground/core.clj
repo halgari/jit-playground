@@ -265,7 +265,7 @@
                                         (recur (next trace)
                                                newenv
                                                new-block))
-                                      (let [nenv (dissoc penv resultvar)]
+                                      (let [newenv (dissoc penv resultvar)]
                                         (recur (next trace)
                                                newenv
                                                (conj new-block
@@ -275,12 +275,12 @@
                                               rarg2 (presolve arg2 penv)]
                                           (if (and (const? rarg1)
                                                    (const? rarg2))
-                                            (let [res (do-op [op arg1 arg2])
+                                            (let [res (do-op op rarg1 rarg2)
                                                   newenv (assoc penv resultvar res)]
                                               (recur (next trace)
                                                      newenv
                                                      new-block))
-                                            (let [nenv (dissoc penv resultvar)]
+                                            (let [newenv (dissoc penv resultvar)]
                                               (recur (next trace)
                                                      newenv
                                                      (conj new-block
@@ -316,6 +316,7 @@
                                         (recur (next trace)
                                                (assoc penv v c)
                                                (conj
+                                                new-block
                                                 [:guard-value v c penv block]))))
 
            [:loop] (generate-assignments new-block penv))))
@@ -329,6 +330,8 @@
 
 (binding [*blocks* (atom larger-code)
           *code-cache* (atom {})]
-  (let [{:keys [block env]} (trace (get @*blocks* 'b) 0 {'i 100 'x 5} 'b [])]
+  (let [{:keys [block env]} (trace (get @*blocks* 'b) 0 {'i 100 'x 5} 'b [])
+        optimized (optimize (get @*blocks* block) {} [])]
             (interp (get @*blocks* block) 0 env)
-            (clojure.pprint/pprint @*blocks*)))
+            (clojure.pprint/pprint @*blocks*)
+            (clojure.pprint/pprint optimized)))

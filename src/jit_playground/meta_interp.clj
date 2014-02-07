@@ -1,6 +1,8 @@
 (ns jit-playground.meta-interp
   (:refer-clojure :exclude [resolve compile]))
 
+;; NOTE: this code is highly buggy, and is written mostly for
+;; demonstration purposes.
 
 (comment
   ;;  VM Opcodes
@@ -35,7 +37,6 @@
             sp 0]
        (promote ip)
        (promote sp)
-       (promote dp)
        (if (< ip code-length)
          (let [inst (nth code ip)
                ip+one (+ ip 1)]
@@ -69,10 +70,14 @@
 (def ^:dynamic *recur-vars*)
 
 
-(defn new-block []
-  (let [nm (gensym "block_")]
-    (swap! *code* assoc nm [])
-    nm))
+(defn new-block
+  ([]
+      (let [nm (gensym "block_")]
+        (swap! *code* assoc nm [])
+        nm))
+  ([nm data]
+     (swap! *code* assoc nm data)
+     nm))
 
 (defn add-inst [& args]
   (swap! *code* update-in [@*current-block*] conj (vec args)))
@@ -273,10 +278,13 @@
 
 (def ^:dynamic *jit-counts*)
 (def ^:dynamic *jit-threshold*)
+(def ^:dynamic *jit-keys*)
 
 
 (defn interp [block ip env]
-  (let [inst (nth block ip)
+  (let [inst (if (< ip (count block))
+               (nth block ip)
+               (assert false (pr-str block)))
         ip+1 (inc ip)]
     (case (first inst)
       :promote (let [[_ arg block] inst]
@@ -291,14 +299,20 @@
               (recur (get @*code* block) 0 env))
 
       :jump-enter-jit (let [[_ greens block] inst
-                            rgreens (mapv (partial resolve env) greens)]
-                        (swap! *jit-counts* update-in [[block rgreens]] (fnil inc 0))
-                        (if (> *jit-threshold* (get @*jit-counts* [block rgreens] 0))
-                          {:mode :trace
-                           :block block
-                           :env env
-                           :greens rgreens}
-                          (recur (get @*code* block) 0 env)))
+                            rgreens (mapv (partial resolve env) greens)
+                            jit-key [block rgreens]]
+                        (if-let [block (get @*jit-keys* jit-key)]
+                          (do (println "found trace")
+                              (clojure.pprint/pprint (get @*code* block))
+                            (recur (get @*code* block) 0 env))
+                          (do (swap! *jit-counts* update-in [jit-key] (fnil inc 0))
+                              (if (> *jit-threshold* (get @*jit-counts* jit-key 0))
+                                {:mode :trace
+                                 :jit-key jit-key
+                                 :block block
+                                 :env env
+                                 :greens rgreens}
+                                (recur (get @*code* block) 0 env)))))
 
       :binop (let [[_ to op a b] inst
                    ra (resolve env a)
@@ -316,6 +330,8 @@
       :nth (let [[_ to v idx] inst
                  rv (resolve env v)
                  ridx (resolve env idx)]
+             (assert (and (< ridx (count rv))
+                          (<= 0 ridx)) (pr-str (type rv) ridx))
              (recur block
                     ip+1
                     (assoc env to (nth rv ridx))))
@@ -326,13 +342,33 @@
                     (recur block ip+1 env))
 
       :set-nth (let [[_ arr idx val] inst
-                 rarr (resolve env arr)
-                 ridx (resolve env idx)
-                 rval (resolve env val)]
-             (aset rarr ridx rval)
-             (recur block
-                    ip+1
-                    env))
+                     rarr (resolve env arr)
+                     ridx (resolve env idx)
+                     rval (resolve env val)]
+                 (aset rarr ridx rval)
+                 (recur block
+                        ip+1
+                        env))
+
+      :guard-value (let [[_ v c blk] inst
+                         rv (resolve env v)]
+                     (if (= rv c)
+                       (recur block ip+1 env)
+                       (recur (get @*code* blk) 0 env)))
+
+      :guard-true (let [[_ v blk] inst
+                         rv (resolve env v)]
+                     (if rv
+                       (recur block ip+1 env)
+                       (recur (get @*code* blk) 0 env)))
+
+      :guard-false (let [[_ v blk] inst
+                         rv (resolve env v)]
+                     (if (not rv)
+                       (recur block ip+1 env)
+                       (recur (get @*code* blk) 0 env)))
+
+      :loop (recur block 0 env)
 
       :exit {:mode :exit
              :env env
@@ -341,86 +377,80 @@
 
 (def hello-world "++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>.")
 
-(comment
-  (def mandelbrot (slurp "https://raw2.github.com/pablojorge/brainfuck/master/samples/mandelbrot.bf"))
-  (def primes (slurp "https://raw2.github.com/pablojorge/brainfuck/master/samples/primes.bf"))
-
-  (def test2 (slurp "https://raw2.github.com/garretraziel/mindfuck/master/tests/test2.b")))
-
-(def bottles (slurp "https://raw2.github.com/garretraziel/mindfuck/master/tests/99bottles.b"))
-
-(println bottles)
-
 
 (def ^:dynamic *trace-end-block*)
 
-(defn trace [block ip env trace]
-  (let [inst (nth block ip)
-        ip+1 (inc ip)]
-    (case (first inst)
-      :promote (let [[_ arg block] inst
-                     rarg (resolve env arg)]
-                 (recur (get @*code* block) 0 env
-                        (conj trace [:guard-value arg rarg block])))
+(defn trace
+  ([block ip env]
+     (trace block ip env []))
+  ([block ip env trace]
+      (let [inst (nth block ip)
+            ip+1 (inc ip)]
+        (case (first inst)
+          :promote (let [[_ arg block] inst
+                         rarg (resolve env arg)]
+                     (recur (get @*code* block) 0 env
+                            (conj trace [:guard-value arg rarg block])))
 
-      :assign (let [[_ to from] inst]
-                (recur block
-                       ip+1
-                       (assoc env to (resolve env from))
-                       (conj trace inst)))
+          :assign (let [[_ to from] inst]
+                    (recur block
+                           ip+1
+                           (assoc env to (resolve env from))
+                           (conj trace inst)))
 
 
-      :jump (let [[_ block] inst]
-              (recur (get @*code* block) 0 env trace))
+          :jump (let [[_ block] inst]
+                  (recur (get @*code* block) 0 env trace))
 
-      :jump-enter-jit (let [[_ greens block] inst
-                            rgreens (mapv (partial resolve env) greens)]
-                        {:mode :optimize
-                         :block block
-                         :env env
-                         :trace (conj trace [:loop])})
+          :jump-enter-jit (let [[_ greens block] inst
+                                rgreens (mapv (partial resolve env) greens)]
 
-      :binop (let [[_ to op a b] inst
-                   ra (resolve env a)
-                   rb (resolve env b)]
-               (recur block
-                      ip+1
-                      (assoc env to (do-op op ra rb))
-                      (conj trace inst)))
+                            {:mode :optimize
+                             :block block
+                             :env env
+                             :trace (conj trace [:loop])})
 
-      :if (let [[_ test then else] inst
-                rtest (resolve env test)]
-            (if rtest
-              (recur (get @*code* then) 0 env (conj trace [:guard-true test else]))
-              (recur (get @*code* else) 0 env (conj trace [:guard-false test then]))))
+          :binop (let [[_ to op a b] inst
+                       ra (resolve env a)
+                       rb (resolve env b)]
+                   (recur block
+                          ip+1
+                          (assoc env to (do-op op ra rb))
+                          (conj trace inst)))
 
-      :nth (let [[_ to v idx] inst
-                 rv (resolve env v)
-                 ridx (resolve env idx)]
-             (recur block
-                    ip+1
-                    (assoc env to (nth rv ridx))
-                    (conj trace inst)))
+          :if (let [[_ test then else] inst
+                    rtest (resolve env test)]
+                (if rtest
+                  (recur (get @*code* then) 0 env (conj trace [:guard-true test else]))
+                  (recur (get @*code* else) 0 env (conj trace [:guard-false test then]))))
 
-      :print-char (let [[_ var] inst
-                        rvar (resolve env var)]
-                    (print (char rvar))
-                    (recur block ip+1 env (conj trace inst)))
+          :nth (let [[_ to v idx] inst
+                     rv (resolve env v)
+                     ridx (resolve env idx)]
+                 (recur block
+                        ip+1
+                        (assoc env to (nth rv ridx))
+                        (conj trace inst)))
 
-      :set-nth (let [[_ arr idx val] inst
-                 rarr (resolve env arr)
-                 ridx (resolve env idx)
-                 rval (resolve env val)]
-             (aset rarr ridx rval)
-             (recur block
-                    ip+1
-                    env
-                    (conj trace inst)))
+          :print-char (let [[_ var] inst
+                            rvar (resolve env var)]
+                        (print (char rvar))
+                        (recur block ip+1 env (conj trace inst)))
 
-      :exit {:mode :exit
-             :env env
-             :block block
-             :trace trace})))
+          :set-nth (let [[_ arr idx val] inst
+                         rarr (resolve env arr)
+                         ridx (resolve env idx)
+                         rval (resolve env val)]
+                     (aset rarr ridx rval)
+                     (recur block
+                            ip+1
+                            env
+                            (conj trace inst)))
+
+          :exit {:mode :exit
+                 :env env
+                 :block block
+                 :trace trace}))))
 
 
 (declare generate-assignments)
@@ -435,100 +465,128 @@
 
 (def ^:dynamic *orig-env*)
 
-(defn optimize [trace penv new-block]
-  (let [inst (first trace)]
-    (case (first inst)
-      :assign (let [[_ to from] inst
-                    rfrom (presolve penv from)]
-                (if (const? rfrom)
-                  (recur (next trace)
-                         (assoc penv to rfrom)
-                         new-block)
-                  (recur (next trace)
-                         (dissoc penv to)
-                         (conj new-block
-                               inst))))
+(defn gen-guard-block [penv block]
+  (let [block-insts (map (fn [[k v]]
+                      [:assign k v])
+                          penv)
+        nm (gensym "fixup_")]
+    (new-block nm (vec (concat block-insts
+                               [[:jump block]])))))
 
-      :binop (let [[_ to op a b] inst
-                   ra (presolve penv a)
-                   rb (presolve penv b)]
-               (if (and (const? ra)
-                        (const? rb))
-                 (recur (next trace)
-                        (assoc penv to (do-op op ra rb))
-                        new-block)
-                 (recur (next trace)
-                        (dissoc penv to)
-                        (conj new-block inst))))
+(defn optimize
+  ([trace penv]
+     (let [result (optimize trace penv [])
+           nm (gensym "trace_")]
+       (println "Optimized trace: " (count trace) " ->" (count result))
+       #_(clojure.pprint/pprint result)
+       (new-block nm result)
+       nm))
+  ([trace penv new-block]
+      (let [inst (first trace)]
+        (case (first inst)
+          :assign (let [[_ to from] inst
+                        rfrom (presolve penv from)]
+                    (cond (const? rfrom)
+                      (recur (next trace)
+                             (assoc penv to rfrom)
+                             new-block)
 
-
-      :guard-true (let [[_ v block] inst
-                        val (presolve penv v)]
-                    (if (const? val)
+                      (= to from) ; no op
                       (recur (next trace)
                              penv
                              new-block)
+
+                      :else
                       (recur (next trace)
-                             penv
+                             (dissoc penv to)
                              (conj new-block
-                                   [:guard-true v block]))))
+                                   inst))))
 
+          :binop (let [[_ to op a b] inst
+                       ra (presolve penv a)
+                       rb (presolve penv b)]
+                   (if (and (const? ra)
+                            (const? rb))
+                     (recur (next trace)
+                            (assoc penv to (do-op op ra rb))
+                            new-block)
+                     (recur (next trace)
+                            (dissoc penv to)
+                            (conj new-block inst))))
 
-      :guard-false  (let [[_ v block] inst
-                          val (presolve penv v)]
-                      (if (const? val)
+          :print-char (let [[_ var] inst]
                         (recur (next trace)
                                penv
-                               new-block)
-                        (recur (next trace)
-                               (assoc penv v false)
-                               (conj
-                                new-block
-                                [:guard-false v block]))))
+                               (conj new-block inst)))
 
-      :guard-value (let [[_ v c block] inst
-                         val (presolve penv v)]
-                     (if (and (const? val)
-                              (= val c))
-                       (recur (next trace)
-                              penv
-                              new-block)
-                       (recur (next trace)
-                              (assoc penv v c)
-                              (conj
-                               new-block
-                               [:guard-value v c block]))))
 
-      :nth (let [[_ to from idx] inst
-                 rfrom (presolve penv from)
-                 ridx (presolve penv idx)]
-             (if (and (string? rfrom) ;; For now only fully constant fold strings
-                      (const? ridx))
-               (recur (next trace)
-                      (assoc penv to (nth rfrom ridx))
-                      new-block)
-               (and (string? ))
-               (recur (next trace)
-                      (dissoc penv to)
-                      (conj new-block inst))))
+          :guard-true (let [[_ v block] inst
+                            val (presolve penv v)]
+                        (if (const? val)
+                          (recur (next trace)
+                                 penv
+                                 new-block)
+                          (recur (next trace)
+                                 penv
+                                 (conj new-block
+                                       [:guard-true v (gen-guard-block penv block)]))))
 
-      :set-nth (let [[_ to from idx] inst]
-             (recur (next trace)
-                    (dissoc penv to)
-                    (conj new-block inst)))
 
-      :loop (generate-assignments new-block penv))))
+          :guard-false  (let [[_ v block] inst
+                              val (presolve penv v)]
+                          (if (const? val)
+                            (recur (next trace)
+                                   penv
+                                   new-block)
+                            (recur (next trace)
+                                   (assoc penv v false)
+                                   (conj
+                                    new-block
+                                    [:guard-false v (gen-guard-block penv block)]))))
+
+          :guard-value (let [[_ v c block] inst
+                             val (presolve penv v)]
+                         (if (and (const? val)
+                                  (= val c))
+                           (recur (next trace)
+                                  (assoc penv v val)
+                                  new-block)
+                           (recur (next trace)
+                                  (assoc penv v c)
+                                  (conj
+                                   new-block
+                                   [:guard-value v c (gen-guard-block penv block)]))))
+
+          :nth (let [[_ to from idx] inst
+                     rfrom (presolve penv from)
+                     ridx (presolve penv idx)]
+                 (if (and (string? rfrom) ;; For now only fully constant fold strings
+                          (const? ridx))
+                   (recur (next trace)
+                          (assoc penv to (nth rfrom ridx))
+                          new-block)
+                   (recur (next trace)
+                          (dissoc penv to)
+                          (conj new-block inst))))
+
+          :set-nth (let [[_ to from idx] inst]
+                     (recur (next trace)
+                            (dissoc penv to)
+                            (conj new-block inst)))
+
+          :loop (generate-assignments new-block penv)))))
 
 
 (defn generate-assignments [new-block penv]
   (concat new-block
           (for [[k v] penv]
-            [:assign k v])))
+            [:assign k v])
+          [[:loop]]))
 
 (defn new-bf-env [code]
   {'code code
    'code-length (count code)
-   'data (object-array (repeat 1024 0))
+   'data (object-array (repeat 10024 0))
    'stack (object-array 32)
    'ip 0
    'dp 0
@@ -536,15 +594,35 @@
    })
 
 
+(defn run-program [program]
+  (let [start-status {:mode :interp
+                      :block :entry
+                      :env (new-bf-env program)}]
+    (loop [status start-status]
+      (println (:mode status) (dissoc status :env :trace))
+      (let [block (get @*code* (:block status))
+            env (:env status)]
+        (case (:mode status)
+          :interp (recur (interp block 0 env))
+
+          :trace (recur (assoc (trace block 0 env)
+                          :jit-key (:jit-key status)))
+
+          :optimize (let [bk (optimize (:trace status) {'code program
+                                                        'code-length (count program)})]
+                      (assert (:jit-key status))
+                      (swap! *jit-keys* assoc (:jit-key status) bk)
+                      (recur {:mode :interp
+                              :block bk
+                              :env env}))
+          :exit (do (println "Finished")
+                    env))))))
+
 (binding [*code* (atom {:entry []})
           *current-block* (atom :entry)
+          *jit-keys* (atom {})
           *jit-counts* (atom {})
           *jit-threshold* 2]
   (analyze bf-interp)
-  (clojure.pprint/pprint  @*code*)
-  (let [jit-result (interp (get @*code* :entry) 0 (new-bf-env
-                                                   hello-world))
-        trace-result (trace (get @*code* (:block jit-result)) 0 (:env jit-result) [])]
-    (clojure.pprint/pprint (optimize (:trace trace-result) {'code hello-world
-                                                            'code-length (count hello-world)} []))
-    (println @*jit-counts*)))
+  (run-program hello-world)
+  (println @*jit-keys*))
